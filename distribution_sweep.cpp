@@ -1,0 +1,570 @@
+#include "distribution_sweep.h"
+
+
+int DISK_READS_SWEEP = 0;
+int DISK_WRITES_SWEEP = 0;
+int DISK_READS_INTERSECTIONS = 0;
+int DISK_WRITES_INTERSECTIONS = 0;
+int verbose = 0;
+int report_intersections = 0;
+int print_progress = 0;
+
+
+std::string generate_X_file(std::string source, int B_lines, int B_ints){
+  array_buffer *line_buffer = new array_buffer(0,1,B_lines,source, &DISK_READS_SWEEP, &DISK_WRITES_SWEEP);
+  int current_slot = 0;
+  std::string X = source+"_X";
+  array_buffer *out_buffer = new array_buffer(1,0,B_ints,X,&DISK_READS_SWEEP,&DISK_WRITES_SWEEP);
+  line_buffer->count_elements_in_disk();
+  while(line_buffer->number_of_stored_elements() > 0){
+    line *l = (line *)line_buffer->retrieve_element();
+    int x1 = l->x1;
+    int x2 = l->x2;
+    if (is_horizontal(*l)){
+      out_buffer->insert_element(&(x1));
+      out_buffer->insert_element(&(x2));
+    }else{
+      out_buffer->insert_element(&(x1));
+    }
+  }
+  out_buffer->dump_remaining_items();
+  out_buffer->close_file();
+  out_buffer->delete_buffer();
+  line_buffer->close_file();
+  line_buffer->delete_buffer();
+  delete line_buffer;
+  delete out_buffer;
+  return X;
+}
+
+void add_last_bound(std::string X){
+  int size = total_elements_in_file(X);
+  FILE * add = fopen(X.c_str(),"ab+");
+  int max = 0;
+  fseek(add, (size-1)*DATA_TYPE_SIZE, SEEK_SET);
+  fread(&max,DATA_TYPE_SIZE,1,add);
+  max = max + 1;
+  fwrite(&max,DATA_TYPE_SIZE,1,add);
+  fclose(add);
+}
+
+void make_sweep_files(std::string source, double memory, double blocksize, std::string X, std::string Y, int B_lines, int B_ints, std::string offset, unsigned long long *measurements, double* estimates){
+  if (verbose ==1){
+  std::cout << offset << "GENERATING NEW X" << std::endl;
+  std::cout << offset << std::endl;
+  }
+  std::string new_x_file = generate_X_file(source, B_lines, B_ints);
+  if (verbose ==1){
+  std::cout << offset << "SORTING NEW X" << std::endl;
+  std::cout << offset << std::endl;
+  }
+
+  unsigned long long reads = 0;
+  unsigned long long writes = 0;
+
+  double total_time = 0;
+
+  double estimate = 0.0;
+  double c = 0.0;
+
+  k_way_mergesort(new_x_file, X, memory, blocksize, 0, offset+"   ",&reads,&writes,&total_time,&estimate,&c); //sorted by x1
+
+  measurements[0] = reads;
+  measurements[1] = writes;
+
+  estimates[0] = total_time;
+  estimates[1] = estimate;
+  estimates[2] = c;
+  //Add imaginary biggest element
+  add_last_bound(X);
+  //Add imaginary biggest element
+  if (verbose ==1){
+    std::cout << offset << std::endl;
+    //output_elements(X);
+  std::cout << offset << "SORTING Y" << std::endl;
+  }
+  k_way_mergesort(source, Y, memory, blocksize, 1, offset+"   ",&reads,&writes,&total_time,&estimate,&c); //sorted by y1
+  measurements[2] = reads;
+  measurements[3] = writes;
+
+  estimates[3] = total_time;
+  estimates[4] = estimate;
+  estimates[5] = c;
+}
+
+int slab_index(int x_i[], int x, int slabs){
+  int i = 0;
+  if (x < x_i[0]){ //When we compute for a horizontal whose x2 is contained in the current slab but whose x1 is contained in another recursion's bounds
+    return 0;
+  }
+  while(i < slabs){
+    if (x >= x_i[i] && x < x_i[i+1]){
+      return i;
+    }
+    i++;
+  }
+  return i-1; // If it doesn't fit within any slab then it means that it's the x2 coordinate of a horizontal whose x1 is contained within the current recursion bounds
+}
+
+int choose_xi(int x_i[], std::string source, int B_ints, int indexes[], int start_point, int end_point, int slabs, std::string offset){
+  array_buffer *read_x = new array_buffer(0,0,B_ints,source,&DISK_READS_SWEEP,&DISK_WRITES_SWEEP);
+  int total_ints = read_x->count_elements_in_disk();
+  if (verbose ==1){
+  std::cout << offset << "ORIGINALLY THERE ARE " << total_ints << " IN FILE ";
+  }
+  read_x->seek_to_point(start_point);
+  int amount_of_ints = end_point - start_point;
+  int elements_per_slab = (int)ceil((double)amount_of_ints/(double)slabs);
+  if (verbose ==1){
+    std::cout << "OF WHICH WE'LL CONSIDER " << amount_of_ints << " TO DIVIDE IN " << slabs << " SLABS AT " << elements_per_slab << " PER SLAB" <<std::endl;
+  }
+  int i = 1;
+  int read = 0;
+  int x_i_to_be_chosen = elements_per_slab;
+  int x_i_slot = 1;
+  int backtrack = 0;
+
+  int *retrieved = (int *)read_x->retrieve_element();
+  int previous = *retrieved;
+  int count = 1;
+
+  x_i[0] = *retrieved;
+  indexes[0] = start_point;
+  // if (end_point != total_ints){ // Should we consider this for the last slab?
+  amount_of_ints++;
+  // }
+  if (verbose==1){
+  std::cout << offset <<"GONNA READ THE ELEMENTS " << std::endl;
+  }
+  while(i < amount_of_ints){
+    // std::cout << offset << i << std::endl;
+    retrieved = (int *)read_x->retrieve_element();
+    // std::cout << offset << "retrieved " << *retrieved <<  std::endl;
+    if (*retrieved == previous){
+      count++;
+    }else{
+      count = 1;
+    }
+    if (x_i_to_be_chosen == i){
+      if (count > 1){
+        x_i_to_be_chosen++;
+      }else{
+        // std::cout << offset << "x_i_slot = " << x_i_slot << std::endl;
+      previous = *retrieved;
+      x_i[x_i_slot] = *retrieved;
+      indexes[x_i_slot] = x_i_to_be_chosen + start_point;
+      x_i_to_be_chosen = x_i_to_be_chosen + elements_per_slab;
+      x_i_slot++;
+    }
+  }else{
+    previous = *retrieved;
+  }
+    i++;
+  }
+  if (verbose==1){
+  std::cout << offset << "DONE READING THE ELEMENTS " << std::endl;
+  }
+  int actual_slabs = 0;
+  if(x_i_slot <= slabs){ //if we happen to have enough duplicates to deplete items
+    //before we can fill all the slabs with at least 1 element
+    x_i[x_i_slot] = previous;
+    indexes[x_i_slot] = i+start_point;
+    actual_slabs = x_i_slot;
+  }else{
+      actual_slabs = slabs;
+  }
+  if (verbose==1){
+  std::cout << offset << "DONE SLAPPING LAST BOUND " << std::endl;
+  }
+  read_x->delete_buffer();
+  read_x->close_file();
+  delete read_x;
+  return actual_slabs;
+}
+
+void swap_active_lists(array_buffer **active_lists, array_buffer **replacement_lists, int index){
+  active_lists[index]->reset_file();
+  active_lists[index]->reset_buffer();
+  array_buffer *temp = active_lists[index];
+  active_lists[index] = replacement_lists[index];
+  replacement_lists[index] = temp;
+}
+
+void report_active_list(line *horizontal, int i, array_buffer **active_lists, array_buffer **replacement_active_lists, unsigned long long* intersections, std::string offset, array_buffer* Intersection_buffer){
+  active_lists[i]->seek_to_start();
+  // std::cout << "stored elements: " << active_lists[i]->number_of_stored_elements() << std::endl;
+    while(active_lists[i]->number_of_stored_elements() > 0){
+      line *l = (line *)active_lists[i]->retrieve_element();
+      if (l->y2 >= horizontal->y1){ //CAN THERE BE OTHER HORIZONTAL LINES THAT OVERLAP? IF NO, THEN THE EQUALITY IS UNNECESSARY.
+        //It is possible to have overlapping horizontal segments (and also overlapping vertical segments, but that doesn't seem to be problematic)
+
+        // if (verbose == 1 && report_intersections == 1){
+        //   std::cout << offset << "line ";
+        //   print_a_line(*l);
+        //   std::cout << " still active" << std::endl;
+        // }
+        replacement_active_lists[i]->insert_element(l);
+
+        if (report_intersections == 1){
+          // std::cout << offset + " ***";
+          // print_a_line(*l);
+          // std::cout << " and ";
+          // print_a_line(*horizontal);
+          // std::cout << " intersect at " << "(" << l->x1 << ","<<horizontal->y1<<")***" << std::endl;
+
+          std::cout << "(" << l->x1 << "," << horizontal->y1 << ")" << std::endl;
+        }
+
+        Intersection_buffer->insert_element(&(l->x1));
+        Intersection_buffer->insert_element(&(horizontal->y1));
+
+        // if (verbose == 1 && report_intersections == 1){
+        //   std::cout << offset << "Increasing number of intersections" << std::endl;
+        // }
+        *intersections = *intersections + 1;
+      }
+    }
+    swap_active_lists(active_lists,replacement_active_lists,i);
+  }
+
+unsigned long long main_memory_step(std::string Y, int N, int B_lines, std::string offset, array_buffer* Intersection_buffer){
+
+  unsigned long long intersections = 0;
+  array_buffer *Sweep_line = new array_buffer(0,1,B_lines,Y,&DISK_READS_SWEEP,&DISK_WRITES_SWEEP); //We need this buffer to be smaller, because we need to accurately document the blocks that have been read from disk
+  array_buffer *Active_list = new array_buffer(1,1,N+1,Y+"A",&DISK_READS_SWEEP,&DISK_WRITES_SWEEP);
+  array_buffer *Replacement_active_list = new array_buffer(1,1,N+1,Y+"B",&DISK_READS_SWEEP,&DISK_WRITES_SWEEP);
+
+  //SWEEPING OF Y
+    int cur_el = 0;
+
+    Sweep_line->count_elements_in_disk();
+
+    if (print_progress ==1 || verbose == 1){
+    std::cout<< offset << "----------------------------------------------------------------------------------" << std::endl;
+    std::cout << offset << "RECURSION STEP FOR FILE " << Y <<" IN MAIN MEMORY" << std::endl;
+    std::cout << offset << "GONNA SWEEP " << Sweep_line->number_of_stored_elements() << " lines" << std::endl;
+    }
+
+    while(Sweep_line->number_of_stored_elements() > 0){
+      if ((print_progress == 1 || verbose == 1 ) && Sweep_line->number_of_stored_elements()%50000 == 0){
+        std::cout << offset << "currently at " << Sweep_line->number_of_stored_elements() << " with " << intersections << " intersections" << std::endl;
+      }
+      line *l = (line *)Sweep_line->retrieve_element();
+      if (is_horizontal(*l)){
+        while(Active_list->number_of_stored_elements() > 0){
+          line *l_active = (line *)Active_list->retrieve_element();
+          if (l_active->y2 >= l->y1){
+            //It is possible to have overlapping horizontal segments (and also overlapping vertical segments, but that doesn't seem to be problematic)
+            Replacement_active_list->insert_element(l_active);
+            if (l_active->x1 >= l->x1 && l_active->x2 <= l->x2){
+            if (report_intersections == 1 ){
+            //   std::cout << offset + " ***";
+            // print_a_line(*l);
+            // std::cout << " and ";
+            // print_a_line(*l_active);
+            // std::cout << " intersect at " << "(" << l_active->x1 << ","<<l->y1<<")" << std::endl;
+            std::cout << "(" << l_active->x1 << "," << l->y1 << ")" << std::endl;
+            }
+            Intersection_buffer->insert_element(&(l_active->x1));
+            Intersection_buffer->insert_element(&(l->y1));
+            intersections++;
+
+          }
+          }
+        }
+        Active_list->reset_buffer();
+        array_buffer *temp = Active_list;
+        Active_list = Replacement_active_list;
+        Replacement_active_list = temp;
+      }else{
+        Active_list->insert_element(l);
+      }
+      cur_el++;
+    }
+    if (print_progress == 1 || verbose == 1 ){
+    std::cout << offset << "DONE SWEEPING WITH " << intersections << " INTERSECTIONS" << std::endl;
+    std::cout << offset << "------------------------------------------------" << std::endl;
+    }
+  //SWEEPING OF Y
+
+    Sweep_line->delete_file();
+    Sweep_line->delete_buffer();
+    delete Sweep_line;
+
+    // Active_list->delete_file(); There should never be a file
+    Active_list->delete_buffer();
+    delete Active_list;
+
+    // Replacement_active_list->delete_file(); There should never be a file
+    Replacement_active_list->delete_buffer();
+    delete Replacement_active_list;
+  return intersections;
+}
+
+unsigned long long recursion_step(std::string Y, std::string X, int i, int j, int B_ints, int B_lines, int M, std::string offset, array_buffer* Intersection_buffer, int tentative_slabs){
+  double N = total_lines_in_file(Y); // N = number of input objects in the problem
+  if ((2*N + B_lines) <= M){ //Since our main memory step will be using 2 buffers of number_of_lines size each and a B_lines sized buffer to read the sweep_line
+    return main_memory_step(Y,N,B_lines,offset, Intersection_buffer);
+  }else{ //If our objects for main-memory solving don't fit then we divide into slabs
+
+  unsigned long long intersections = 0;
+
+  //when the elements per slab become manageable in main memory we stop the recursion
+  int slabs = tentative_slabs;
+
+  //SELECTION OF BOUNDARIES FOR SLABS
+  int *x_i = new int[slabs+1]; //It's highly unlikely that the amount of slabs will exceed the stack size, but just in case.
+  int *indexes = new int[slabs+1];
+  if (print_progress == 1 || verbose == 1 ){
+  std::cout<< offset << "----------------------------------------------------------------------------------" << std::endl;
+  std::cout << offset << "RECURSION STEP FOR FILES " << Y <<" and " << X << " [" << i << "," << j << ") IN EXTERNAL MEMORY" << std::endl;
+  std::cout << offset << "total lines in file: " << N <<  ". We'll try to make " << slabs << " slabs." << std::endl;
+  std::cout << offset << "Choosing slab bounds for "<< slabs << " slabs" << std::endl;
+  }
+  slabs = choose_xi(x_i, X, B_ints,indexes,i,j,slabs,offset);
+  //SELECTION OF BOUNDARIES FOR SLABS
+  if (print_progress == 1 || verbose == 1 ){
+  std::cout << offset << "A posteriori "<< slabs << " slabs" << std::endl;
+    int ss = 0;
+    while(ss < slabs){
+      std::cout << offset << "slab " << ss << " := [" << x_i[ss] << "," << x_i[ss+1] << ")" << std::endl;
+      ss++;
+    }
+  }
+
+  // std::cout << "actual slabs " << slabs << std::endl;
+
+  //CREATION OF READ/WRITE BUFFERS
+  // print_all_elements(x_i,11,1);
+  // print_all_elements(indexes,11,1);
+  array_buffer** active_lists;
+  active_lists = new array_buffer*[slabs];
+
+  array_buffer** replacement_active_lists;
+  replacement_active_lists = new array_buffer*[slabs];
+
+  array_buffer** y_i_lists;
+  y_i_lists = new array_buffer*[slabs];
+
+  array_buffer *Y_buffer = new array_buffer(0,1,B_lines,Y, &DISK_READS_SWEEP, &DISK_WRITES_SWEEP);
+  // Y_buffer->open_file();
+  if (verbose == 1){
+  std::cout <<offset <<"CREATION OF BUFFERS" << std::endl;
+  }
+  int index = 0;
+  while(index < slabs){
+    std::string file;
+    file = std::to_string(index);
+    active_lists[index] = new array_buffer(1,1, B_lines, file, &DISK_READS_SWEEP, &DISK_WRITES_SWEEP);
+    file = file + "_" + file;
+    replacement_active_lists[index] = new array_buffer(1,1, B_lines, file, &DISK_READS_SWEEP, &DISK_WRITES_SWEEP);
+    file = Y+"_"+std::to_string(index);
+    y_i_lists[index] = new array_buffer(1,1, B_lines, file, &DISK_READS_SWEEP, &DISK_WRITES_SWEEP);
+    index++;
+  }
+  if (verbose == 1){
+  std::cout <<offset << "DONE CREATING BUFFERS" << std::endl;
+  }
+  //CREATION OF READ/WRITE BUFFERS
+
+//SWEEPING OF Y
+  int cur_el = 0;
+  Y_buffer->count_elements_in_disk();
+  if (verbose == 1){
+  std::cout << offset <<"BEGIN SWEEPING with " << slabs << " lists" << std::endl;
+  std::cout <<offset<< "GONNA SWEEP " << Y_buffer->number_of_stored_elements() << " lines{" << std::endl;
+  }
+  while(Y_buffer->number_of_stored_elements() > 0){
+    if ((print_progress == 1 || verbose == 1 ) && Y_buffer->number_of_stored_elements()%50000 == 0){
+      std::cout << offset << "  currently at " << Y_buffer->number_of_stored_elements() << " with " << intersections << " intersections" << std::endl;
+    }
+    line *l = (line *)Y_buffer->retrieve_element();
+    if (verbose == 1){
+    std::cout << offset << "  "<<cur_el <<" :";
+    print_a_line(*l);
+    }
+    int slab_i = slab_index(x_i,l->x1,slabs);
+    if (is_horizontal(*l)){
+      int slab_j = slab_index(x_i, l->x2, slabs);
+      if (verbose == 1){
+      std::cout << " H ";
+      std::cout << " slab: ";
+      }
+        if (verbose==1){
+          std::cout << slab_i << " (" << l->x1 << " contained in [" << x_i[slab_i] << "," << x_i[slab_i+1] << ")) and ";
+          std::cout << slab_j << " (" << l->x2 << " contained in [" << x_i[slab_j] << "," << x_i[slab_j+1] << ")) " << std::endl;
+          std::cout << offset << "    Operations of Horizontal line: " << std::endl;
+        }
+          while(slab_i <= slab_j){
+
+            if (spans_completely(*l,x_i[slab_i],x_i[slab_i+1])){
+              if (verbose==1){
+                std::cout << offset  << "    completely spans s" << slab_i << ":=[" << x_i[slab_i] << "," << x_i[slab_i+1] <<")" << ", checking the active list" << std::endl;
+              }
+            report_active_list(l, slab_i,active_lists, replacement_active_lists,&intersections, offset + "      ", Intersection_buffer);
+            }else{
+              if (verbose == 1){
+                std::cout << offset << "    inserting to y_" << slab_i << ", since it doesn't completely span it" << std::endl;
+              }
+              y_i_lists[slab_i]->insert_element(l);
+            }
+            slab_i++;
+          }
+          if (verbose == 1){
+          std::cout << std::endl;
+          }
+    }else{
+      if (verbose == 1){
+       std::cout << " V ";
+       std::cout << " slab: ";
+       std::cout << slab_i << " (" << l->x1 << " contained in [" << x_i[slab_i] << "," << x_i[slab_i+1] <<")"<< std::endl;
+      }
+      active_lists[slab_i]->insert_element(l);
+      y_i_lists[slab_i]->insert_element(l);
+    }
+    cur_el++;
+  }
+  if (print_progress == 1 || verbose == 1 ){
+  std::cout << offset << "}DONE SWEEPING, with total intersections = " << intersections <<  std::endl;
+  }
+//SWEEPING OF Y
+
+//DELETION OF NO LONGER NECESSARY DATA
+  int k = 0;
+  while(k < slabs){
+    active_lists[k]->delete_file();
+    replacement_active_lists[k]->delete_file();
+    active_lists[k]->delete_buffer(); //invokes delete[] since it is a new object[]
+    replacement_active_lists[k]->delete_buffer();
+    delete active_lists[k]; //since it is a new object
+    delete replacement_active_lists[k]; //since it is a new object
+
+    y_i_lists[k]->dump_remaining_items();
+    y_i_lists[k]->close_file();
+    y_i_lists[k]->delete_buffer();
+    //delete y_i_lists[i]; // need it to give filename string
+    k++;
+  }
+  delete[] active_lists; //since it is a new object*[]
+  delete[] replacement_active_lists;
+  Y_buffer->delete_file();
+  Y_buffer->delete_buffer();
+  delete Y_buffer;
+  delete[] x_i;
+//DELETION OF NO LONGER NECESSARY DATA
+
+//CALL TO RECURSIVE STEPS
+if (print_progress == 1 || verbose == 1 ){
+std::cout << offset << "CALL TO RECURSIONS{" << std::endl;
+}
+  k = 0;
+  while(k < slabs){
+    if (print_progress == 1 || verbose == 1 ){
+    std::cout << offset << "  CALLING RECURSION " << k << " WITH " << y_i_lists[k]->number_of_stored_elements() << " ELEMENTS{" << std::endl;
+    }
+    intersections = intersections + recursion_step(y_i_lists[k]->get_filename(), X, indexes[k], indexes[k+1]-1, B_ints, B_lines, M, offset+"    ",Intersection_buffer, tentative_slabs);
+    delete y_i_lists[k]; //we've used the filename, so we delete it
+    if (print_progress == 1 || verbose == 1 ){
+    std::cout << offset << "  }CLOSING RECURSION " << k << std::endl;
+    }
+    k++;
+  }
+  if (print_progress == 1 || verbose == 1 ){
+  std::cout << offset << "}OUT OF RECURSIONS WITH TOTAL " << intersections << " INTERSECTIONS" << std::endl;
+  std::cout << offset << "------------------------------------------------" << std::endl;
+  }
+//CALL TO RECURSIVE STEPS
+
+//DELETION OF REMAINING DATA
+  delete[] y_i_lists;
+  delete[] indexes;
+//DELETION OF REMAINING DATA
+return intersections;
+}
+}
+
+unsigned long long orthogonal_segment_intersection(std::string source, double memory, double blocksize, int prints_on, int intersections_on, int progress_on, unsigned long long *measurements, double* estimates, int tentative_slabs){
+  print_progress = progress_on;
+
+  if (print_progress==1){
+  std::cout << std::endl;
+  std::cout << "ORTHOGONAL SEGMENT INTERSECTION IN EXTERNAL MEMORY[" << std::endl;
+  }
+
+  std::string X = source +"_X";
+  std::string Y = source +"_Y";
+  std::string offset = "  ";
+  verbose = prints_on;
+  DISK_READS_SWEEP = 0;
+  DISK_WRITES_SWEEP = 0;
+  DISK_READS_INTERSECTIONS = 0;
+  DISK_WRITES_INTERSECTIONS = 0;
+  report_intersections = intersections_on;
+  struct timespec start, end;
+  double M = memory/(4.0*DATA_TYPE_SIZE); //Each line uses 4 ints, M = number of objects that fit in main memory
+  double B = blocksize/(4.0*DATA_TYPE_SIZE); //B = number of objects that fit in a block
+  double m = memory/blocksize; // m = number of blocks that fit in main memory
+  //double s = ceil((m-1)/100.0); // For each slab we need: 1 block for the active list, 1 block for the Y_i (array of lines contained in the
+  //slab sorted by their y coordinate) and 1 block for the new active list (which is generated upon discovery of a horizontal line).
+  //We also leave out 1 utility block (hence the m-1).
+  int B_ints = (int)(blocksize/DATA_TYPE_SIZE); //Amount of elements that fit in a block.
+  int B_lines = (int)B;
+
+  if (print_progress==1){
+  std::cout << std::endl;
+  std::cout << "  MAKING SWEEPFILES{" << std::endl;
+  }
+
+  make_sweep_files(source,memory,blocksize,X,Y,B_lines,B_ints,offset, measurements, estimates);
+    double N = total_lines_in_file(Y);
+    double n = N/B;
+    double aprox_num_reads = n*log(n)/log(m);
+
+  //buffer for intersection reporting
+  std::string file = "INTERSECTIONS";
+  array_buffer *Intersection_buffer = new array_buffer(1,0, B_ints, file, &DISK_READS_INTERSECTIONS, &DISK_WRITES_INTERSECTIONS);
+  //buffer for intersection reporting
+
+  if (print_progress==1){
+  std::cout << "  {" << std::endl;
+  std::cout << std::endl;
+    std::cout << "  STARTING FIRST RECURSION OF DISTRIBUTION SWEEPING{" << std::endl;
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  unsigned long long intersections = recursion_step(Y, X, 0, total_elements_in_file(X)-1, B_ints, B_lines, (int)M, offset+" ", Intersection_buffer, tentative_slabs);
+  clock_gettime(CLOCK_MONOTONIC, &end);
+
+  double total_time = operation_time_in_seconds(operation_time_in_nanos(start,end));
+  double c = (double)(DISK_READS_SWEEP+DISK_WRITES_SWEEP)/aprox_num_reads;
+
+  if (print_progress==1){
+    std::cout << "  }END OF FIRST RECURSION OF DISTRIBUTION SWEEPING" << std::endl;
+    std::cout << "  Total time of Distribution Sweeping: ";
+    std::cout << total_time;
+  std::cout << std::endl;
+  std::cout <<"   IN THEORY: nlog(n) ~ " << aprox_num_reads << std::endl;
+  std::cout <<"   READS: " << DISK_READS_SWEEP << " WRITES: " << DISK_WRITES_SWEEP << std::endl;
+  std::cout << "   With C = " << c << " we have C*nlog(n) = " << c <<"*"<<aprox_num_reads <<" = "  << c*aprox_num_reads << std::endl;
+  std::cout << std::endl;
+  std::cout <<"]END OF ORTHOGONAL SEGMENT INTERSECTION IN EXTERNAL MEMORY" << std::endl;
+  }
+  remove(X.c_str());
+  Intersection_buffer->dump_remaining_items();
+  Intersection_buffer->close_file();
+  Intersection_buffer->delete_buffer();
+
+  measurements[4] = DISK_READS_SWEEP;
+  measurements[5] = DISK_WRITES_SWEEP;
+  measurements[6] = DISK_READS_INTERSECTIONS;
+  measurements[7] = DISK_WRITES_INTERSECTIONS;
+
+  estimates[6] = total_time;
+  estimates[7] = aprox_num_reads;
+  estimates[8] = c;
+
+  estimates[9] = (double)intersections/B_ints;
+  estimates[10] = (double)DISK_WRITES_INTERSECTIONS*B_ints/intersections;
+  delete Intersection_buffer;
+  return intersections;
+}
